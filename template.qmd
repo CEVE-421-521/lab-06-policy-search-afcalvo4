@@ -1,16 +1,13 @@
 ---
 title: "Lab 6: Policy Search"
-author: "Your Name (netID)"
+author: "Andres Calvo (ac228)"
 jupyter: julia-1.10
-date: 2024-03-01
+date: 2024-03-08
 week: 7
 categories: [Lab]
 
 format: 
     html: default
-
-    # YOU DO NOT NEED BOTH PDF AND DOCX.
-    # COMMENT OR DELETE THE ONE YOU DON'T WANT TO USE.
     pdf:
         documentclass: article
         fontsize: 11pt
@@ -18,17 +15,11 @@ format:
             - margin=1in  
         number-sections: true
         code-line-numbers: true
-    #docx: 
-    #    toc: true
-    #    fig-format: png
-    #    number-sections: true
-    #    code-line-numbers: true
-
 date-format: "ddd., MMM. D"
 
-execute: 
-  cache: true
-  freeze: auto
+#execute: 
+ # cache: true
+  #freeze: auto
 
 bibliography: references.bib
 ---
@@ -46,12 +37,217 @@ using Metaheuristics
 using Plots
 using Random
 using Unitful
+using Extremes
+using StatsPlots
 
 Plots.default(; margin=5Plots.mm)
 ```
+# Model
 
+The following are the model parameters and functions defined in previous labs:
+
+## Building object
+::: {.callout-important}
+The value of the building was reduced to 3'445.000 USD for a content to structure ratio valuation lower than the original 1:10. This is to allow diverse NPV for the whole range of elevation actions.
+:::
 ```{julia}
-function objective_function(a::AbstractFloat)
-    return true # PLACEHOLDER
+#| output: false
+offset = 6
+building = let
+    haz_fl_dept = CSV.read("data/haz_fl_dept.csv",DataFrame)
+    desc = "Average Light Industrial, Contents (Equipment/Inventory)"
+    row = @rsubset(haz_fl_dept, :Description == desc)[1,:]
+    area = 33000u"ft^2"
+    height_above_gauge = (offset)u"ft"
+    House(
+        row;
+        area = area,
+        height_above_gauge = height_above_gauge,
+        value_usd = 3_445_000,
+        )
 end
 ```
+## Sea Level Rise model
+The Sea-level rise (SLR) is adapted from @oddo_coastal:2017
+```{julia}
+#| output: false
+slr_scenarios = let
+    df = CSV.read("data/slr_oddo.csv", DataFrame)
+    [Oddo17SLR(a, b, c, tstar, cstar) for (a, b, c, tstar, cstar) in eachrow(df)]
+end
+```
+## Depth frequency function
+The depth frequency model uses a Generalized Extreme Value distribution. The parameters are calibrated using the `Extremes` package. The data is obtained from [NOOA](https://tidesandcurrents.noaa.gov/waterlevels.html?id=8771450&units=standard&bdate=19040101&edate=20240301&timezone=GMT&datum=MLLW&interval=m&action=data). This dataset correspond to the monthly water level for *8771450 Galveston Pier 21* that is next to the building (ID: 8771450).
+```{julia}
+water_levels = CSV.read("CO-OPS_8771450_wl.csv",DataFrame)
+let 
+    heighest_levels = water_levels.Highest
+
+    p = plot(water_levels.Date,heighest_levels;
+             xlabel = "Time",
+             xrotation = 90,
+             ylabel = "Water elevation (ft)",
+             ylims = [trunc(minimum(heighest_levels)) - 1,
+                      trunc(maximum(heighest_levels)) + 1],
+             label = "Highest elevations from station datum",
+             legend = :outerbottom,
+             size = (800, 400),
+             color = "dodgerblue4",
+             linewidth = 1,)
+    p
+end
+```
+The `gevfit` function is used to estimate the parameters of the distribution that fit the data. The following is the distribution obtained.
+```{julia}
+θ = gevfit(water_levels, :Highest).θ̂
+let
+    μ = θ[1]
+    σ = exp(θ[2])
+    ξ = θ[3]
+    
+    p = plot()
+    plot!(p,GeneralizedExtremeValue(μ, σ, ξ);
+        xlabel = "Water level (ft)",
+        ylabel = "Probability density",
+        ylims = [0,0.5],
+        xlims = [0,15],
+        label = "GEV distribution μ = $(round(μ, digits = 2)), σ = $(round(σ, digits = 2)), ξ = $(round(ξ, digits = 2))",
+        legend = :outerbottom,
+        size = (500, 400),
+        color = "teal",
+        linewidth = 3,)
+    plot!(p, GeneralizedExtremeValue(5, 1.5, 0.1);
+          color = "orangered",
+          linewidth = 2,
+          style = :dash,
+          label = "Basic distribution",
+          )
+end
+```
+```{julia}
+function draw_surge_distribution()
+    μ = θ[1]
+    σ = exp(θ[2])
+    ξ = θ[3]
+    GeneralizedExtremeValue(μ, σ, ξ)
+end
+```
+## Discount rate
+
+The discount rate is modeled using a normal distribution
+```{julia}
+function draw_discount_rate()
+    return rand(truncated(Normal(0.05, 0.025),0,Inf))
+end
+```
+## Model parameters
+```{julia}
+#| output: false
+p = ModelParams(; house = building,
+                  years = 2024:2074)
+```
+## Objective Function
+The objective function is defined as the NPV for a simulation on a given number of SOW
+```{julia}
+sows = let
+    N_SOW = 1000
+    sows = [SOW(rand(slr_scenarios),
+            draw_surge_distribution(),
+            draw_discount_rate()) for _ in 1:N_SOW]
+end         
+function objective_function(a::Vector{Float64})
+    a = a[1]
+    a = Action((a)u"ft")
+    NPV = -[run_sim(a, s, p) for s in sows]./1e6
+    return mean(NPV)
+end
+```
+
+### *Brute force* solution
+1000 SOW are used to provide a **brute force** results that allows comparison for the optimization problem.
+
+```{julia}
+let 
+    N_SOW = 100
+    sows = [SOW(rand(slr_scenarios),
+            draw_surge_distribution(),
+            draw_discount_rate()) for _ in 1:N_SOW] 
+    elevations = 0.0:14.0
+    NPVs = [objective_function([e]) for e in elevations]
+    p = plot(elevations, NPVs;
+            xlabel = "Elevation action (ft)",
+            ylabel = "Mean NPV (US Millions)",
+            ylims = [0,trunc(maximum(NPVs)) + 1],
+            xlims = [0,14],
+            label = "Average NPV for $N_SOW SOW's",
+            legend = :outerbottom,
+            size = (500, 400),
+            color = "orangered",
+            linewidth = 3,)
+    scatter!([5],[minimum(NPVs)],
+             label = "Brute force Minimum",
+             color = "dodgerblue4",)
+    p
+end
+```
+## Optimization 
+The initial optimization uses the `optimize` function as well as the `ECA` algorithm from `heuristics.jl` package using the default parameters. An initial value for $SOW = 10$ is used. The random seed is 2024 and the options include a time limit of 20.0 and a tolerance of 1E-04. 
+
+```{julia}
+sows = let
+    N_SOW = 10
+    sows = [SOW(rand(slr_scenarios),
+            draw_surge_distribution(),
+            draw_discount_rate()) for _ in 1:N_SOW]
+end
+Random.seed!(2024)
+options = Options(; time_limit = 20.0, f_tol_rel = 1e-4)
+bounds = boxconstraints( lb = 0.0, ub = 14.0)
+result = optimize(objective_function, bounds)
+```
+```{julia}
+algorithm = ECA(; options = options)
+result = optimize(objective_function, bounds,algorithm)
+```
+### Large ensamble
+Having validate the results, a large ensamble is used find the optimal building elevation. In this case, $SOW = 100.000$ is used. The tolerance still considers *inches* precision in the elevation. The time was change to 40.
+```{julia}
+sows = let
+    N_SOW = 100_000
+    sows = [SOW(rand(slr_scenarios),
+            draw_surge_distribution(),
+            draw_discount_rate()) for _ in 1:N_SOW]
+end
+Random.seed!(2024)
+options = Options(; time_limit = 40.0, f_tol_rel = 1e-4)
+algorithm = ECA(; options = options)
+result = optimize(objective_function, bounds, algorithm)
+```
+# Discussion
+
+1. **Problem description**
+The problem that we are setting is the following:
+
+**Objective:** Minimize NPV
+
+We want to minimize the average Net Present Value of the cost of elevating the building and the expected costs due to flood events.
+
+**Decision variables:** Elevation height in ft
+
+Our actions are the amount of elevation. This is a continuous variable (it might be discrete) that takes values from 0 to 14 ft
+
+**States of the world:** SLR, Discount rate, Depth frequency distribution
+
+These are uncertain, time-evolving realizations of the that can take different values in every time iteration.
+
+**Parameters:** building’s depth damage curve, valuation, elevation costs, area, offset
+
+The parameters are the building descriptors, at the moment they are treated as deterministic values.
+
+2. **SOW's assumptions**
+
+There could be many SOW that are not credible or are extremely unlikely and yet have the same weigth. Nevertheless, as the number of realizations gets larger, the influence can be less important. Another assumption, is that the SOW variables are independent. Other assumptions such as stationary processes and the selected probabilisitic distribution and its parameters also impact the simulation results.
+
+3. **Additional considerations**
+
+Change in the hazard due to infrastructure is not contemplated. For example, are there flood prevention infrastructure in Galveston? If so, how the hazard change and how to account the risk of failure or misfunction of such infrastructure. The model is very sensitive to economic evaluation of the building and the elevation costs. Finally, other risk protection options can be consider in order to optimize given a larger pool of actions.
